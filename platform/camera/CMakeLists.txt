@@ -30,6 +30,8 @@ target_compile_definitions(camera_client
   PRIVATE
   ${ANKI_BUILD_CXX_COMPILE_DEFINITIONS}
   USE_ION
+  _FILE_OFFSET_BITS=64
+  _TIME_BITS=64
 )
 
 target_compile_options(camera_client

@@ -31,6 +31,8 @@
 
 #define VIDEO_DEVICE    "/dev/video0"
 #define SUBDEV_DEVICE   "/dev/v4l-subdev8"
+#define CAMERA_SUBDEV_SCAN_MAX 32
+#define CAMERA_MAX_CONSEC_EIO  8
 
 #define CAPTURE_WIDTH_1MP   1280
 #define CAPTURE_HEIGHT_1MP  720
@@ -96,7 +98,7 @@ struct camera_context {
 
 static struct camera_context g_ctx;
 
-#define CAMERA_VFE_REOPEN_DELAY_MS 2000
+#define CAMERA_VFE_REOPEN_DELAY_MS 250
 static struct timespec g_last_camera_close_time = {0, 0};
 
 static int xioctl(int fd, unsigned long request, void* arg) {
@@ -148,9 +150,10 @@ static int v4l2_request_buffers(struct camera_context* ctx)  {
         return -1;
     }
 
-    ctx->num_buffers = req.count;
+    uint32_t target = req.count > NUM_BUFFERS ? NUM_BUFFERS : req.count;
+    ctx->num_buffers = 0;
 
-    for (uint32_t i = 0; i < ctx->num_buffers; i++) {
+    for (uint32_t i = 0; i < target; i++) {
         struct v4l2_plane planes[1] = {{0}};
         struct v4l2_buffer buf = {0};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -165,20 +168,21 @@ static int v4l2_request_buffers(struct camera_context* ctx)  {
         }
 
         ctx->buffers[i].length = planes[0].length;
-        ctx->buffers[i].start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->video_fd, planes[0].m.mem_offset);
-
+        ctx->buffers[i].start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, ctx->video_fd, planes[0].m.mem_offset);
         if (ctx->buffers[i].start == MAP_FAILED) {
+            ctx->buffers[i].start = NULL;
             fprintf(stderr, "camera: mmap failed: %s\n", strerror(errno));
             return -1;
         }
         ctx->buffers[i].queued = 0;
-
         ctx->wrappers[i].total_size = sizeof(anki_camera_frame_t) + ctx->frame_size;
         ctx->wrappers[i].frame = malloc(ctx->wrappers[i].total_size);
         if (!ctx->wrappers[i].frame) {
             fprintf(stderr, "camera: wrapper allocation failed\n");
             return -1;
         }
+        ctx->num_buffers = i + 1;
     }
 
     return 0;
@@ -251,18 +255,135 @@ static void v4l2_cleanup_buffers(struct camera_context* ctx)
     ctx->num_buffers = 0;
 }
 
+static void resolve_video_device(char* out, size_t out_sz)
+{
+    const char* env_dev = getenv("ANKI_CAMERA_VIDEO_DEV");
+    if (env_dev != NULL && env_dev[0] != '\0') {
+        snprintf(out, out_sz, "%s", env_dev);
+        return;
+    }
+    snprintf(out, out_sz, "%s", VIDEO_DEVICE);
+}
+
+static int match_sensor_name(const char* name)
+{
+    const char* custom = getenv("ANKI_CAMERA_MATCH_SUBDEV");
+    if (custom != NULL && custom[0] != '\0') {
+        return strncmp(name, custom, strlen(custom)) == 0;
+    }
+    return strncmp(name, "gc1066", 6) == 0 ||
+           strncmp(name, "bf2253l", 7) == 0;
+}
+
+static void resolve_sensor_subdev(char* out, size_t out_sz)
+{
+    const char* env_subdev = getenv("ANKI_CAMERA_SUBDEV");
+    if (env_subdev != NULL && env_subdev[0] != '\0') {
+        snprintf(out, out_sz, "%s", env_subdev);
+        return;
+    }
+
+    const char* sysfs_root = getenv("ANKI_CAMERA_SYSFS_ROOT");
+    if (sysfs_root == NULL || sysfs_root[0] == '\0') {
+        sysfs_root = "/sys/class/video4linux";
+    }
+
+    for (int i = 0; i < CAMERA_SUBDEV_SCAN_MAX; i++) {
+        char path[160];
+        char name[96];
+        snprintf(path, sizeof(path), "%s/v4l-subdev%d/name", sysfs_root, i);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        if (fgets(name, sizeof(name), f) != NULL && match_sensor_name(name)) {
+            fclose(f);
+            snprintf(out, out_sz, "/dev/v4l-subdev%d", i);
+            return;
+        }
+        fclose(f);
+    }
+    snprintf(out, out_sz, "%s", SUBDEV_DEVICE);
+}
+
+static void wait_vfe_reopen_cooldown(void)
+{
+    if (g_last_camera_close_time.tv_sec == 0) {
+        return;
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return;
+    }
+    int64_t elapsed_ms = ((int64_t)now.tv_sec - (int64_t)g_last_camera_close_time.tv_sec) * 1000LL
+                       + ((int64_t)now.tv_nsec - (int64_t)g_last_camera_close_time.tv_nsec) / 1000000LL;
+    if (elapsed_ms < 0 || elapsed_ms >= CAMERA_VFE_REOPEN_DELAY_MS) {
+        return;
+    }
+    int64_t rem_ms = CAMERA_VFE_REOPEN_DELAY_MS - elapsed_ms;
+    struct timespec req = { .tv_sec = (time_t)(rem_ms / 1000LL),
+                            .tv_nsec = (long)((rem_ms % 1000LL) * 1000000LL) };
+    struct timespec rem = {0};
+    for (int tries = 0; tries < 8; tries++) {
+        if (nanosleep(&req, &rem) == 0 || errno != EINTR) {
+            break;
+        }
+        req = rem;
+    }
+}
+
+static void camera_init_fail_cleanup(void)
+{
+    if (g_ctx.num_buffers > 0) {
+        v4l2_cleanup_buffers(&g_ctx);
+    }
+    if (g_ctx.video_fd >= 0) {
+        close(g_ctx.video_fd);
+        g_ctx.video_fd = -1;
+    }
+    if (g_ctx.subdev_fd >= 0) {
+        close(g_ctx.subdev_fd);
+        g_ctx.subdev_fd = -1;
+    }
+    pthread_cond_destroy(&g_ctx.frame_cond);
+    pthread_mutex_destroy(&g_ctx.frame_mutex);
+}
+
+static void store_captured_frame(uint32_t buf_idx, uint64_t timestamp_ns)
+{
+    if (buf_idx >= g_ctx.num_buffers || g_ctx.buffers[buf_idx].start == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_ctx.frame_mutex);
+    uint32_t slot = g_ctx.ring_write_slot % NUM_RING_FRAMES;
+    g_ctx.ring_write_slot++;
+    anki_camera_frame_t* f = g_ctx.ring_frames[slot];
+    f->timestamp = timestamp_ns;
+    f->frame_id = g_ctx.frame_id++;
+    f->width = g_ctx.width;
+    f->height = g_ctx.height;
+    f->bytes_per_row = g_ctx.bytes_per_row;
+    f->bits_per_pixel = 10;
+    f->format = g_ctx.pixel_format;
+    memcpy(f->data, g_ctx.buffers[buf_idx].start, g_ctx.frame_size);
+    if (f->frame_id == 1 || f->frame_id % 150 == 0) {
+        const uint8_t* d = (const uint8_t*)g_ctx.buffers[buf_idx].start;
+        fprintf(stderr, "capture: frame %u slot %u ts=%llu data[0..3]=%02x %02x %02x %02x\n",
+                f->frame_id, slot, (unsigned long long)timestamp_ns, d[0], d[1], d[2], d[3]);
+    }
+    pthread_cond_signal(&g_ctx.frame_cond);
+    pthread_mutex_unlock(&g_ctx.frame_mutex);
+}
+
 static void* capture_thread_func(void* arg)
 {
     (void)arg;
+    int consec_eio = 0;
 
     while (1) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(g_ctx.video_fd, &fds);
         FD_SET(g_ctx.stop_pipe[0], &fds);
-        int nfds = (g_ctx.video_fd > g_ctx.stop_pipe[0]
-                    ? g_ctx.video_fd : g_ctx.stop_pipe[0]) + 1;
-
+        int nfds = (g_ctx.video_fd > g_ctx.stop_pipe[0] ? g_ctx.video_fd : g_ctx.stop_pipe[0]) + 1;
         struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
         int r = select(nfds, &fds, NULL, NULL, &tv);
         if (r < 0) {
@@ -271,106 +392,70 @@ static void* capture_thread_func(void* arg)
             break;
         }
         if (r == 0) continue;
-
         if (FD_ISSET(g_ctx.stop_pipe[0], &fds)) break;
         if (!FD_ISSET(g_ctx.video_fd, &fds)) continue;
 
         struct v4l2_plane planes[1] = {{0}};
-        struct v4l2_buffer buf = {0};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.m.planes = planes;
-        buf.length = 1;
-
+        struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+                                   .memory = V4L2_MEMORY_MMAP, .m.planes = planes, .length = 1 };
         if (xioctl(g_ctx.video_fd, VIDIOC_DQBUF, &buf) < 0) {
-            fprintf(stderr, "capture thread: VIDIOC_DQBUF failed: %s\n", strerror(errno));
+            if (errno == EAGAIN || errno == EINTR) continue;
+            if (errno == ENODEV || ++consec_eio >= CAMERA_MAX_CONSEC_EIO) break;
             continue;
         }
-
-        uint64_t timestamp_ns = (uint64_t)buf.timestamp.tv_sec  * 1000000000ULL
-                              + (uint64_t)buf.timestamp.tv_usec * 1000ULL;
-
-        pthread_mutex_lock(&g_ctx.frame_mutex);
-
-        uint32_t slot = g_ctx.ring_write_slot % NUM_RING_FRAMES;
-        g_ctx.ring_write_slot++;
-        anki_camera_frame_t* f = g_ctx.ring_frames[slot];
-
-        f->timestamp       = timestamp_ns;
-        f->frame_id        = g_ctx.frame_id++;
-        f->width           = g_ctx.width;
-        f->height          = g_ctx.height;
-        f->bytes_per_row   = g_ctx.bytes_per_row;
-        f->bits_per_pixel  = 10;
-        f->format          = g_ctx.pixel_format;
-        memcpy(f->data, g_ctx.buffers[buf.index].start, g_ctx.frame_size);
-
-        if (f->frame_id == 1 || f->frame_id % 150 == 0) {
-            const uint8_t* d = (const uint8_t*)g_ctx.buffers[buf.index].start;
-            fprintf(stderr, "capture: frame %u slot %u ts=%llu data[0..3]=%02x %02x %02x %02x\n",
-                    f->frame_id, slot, (unsigned long long)timestamp_ns,
-                    d[0], d[1], d[2], d[3]);
+        consec_eio = 0;
+        if (buf.index < g_ctx.num_buffers && !(buf.flags & V4L2_BUF_FLAG_ERROR)) {
+            uint64_t ts_ns = (uint64_t)buf.timestamp.tv_sec * 1000000000ULL
+                           + (uint64_t)buf.timestamp.tv_usec * 1000ULL;
+            store_captured_frame(buf.index, ts_ns);
+        } else if (buf.flags & V4L2_BUF_FLAG_ERROR) {
+            fprintf(stderr, "capture thread: dropping corrupted buffer index=%u\n", buf.index);
         }
-
-        pthread_cond_signal(&g_ctx.frame_cond);
-        pthread_mutex_unlock(&g_ctx.frame_mutex);
-
+        buf.flags = 0;
         buf.m.planes = planes;
         if (xioctl(g_ctx.video_fd, VIDIOC_QBUF, &buf) < 0) {
             fprintf(stderr, "capture thread: VIDIOC_QBUF failed: %s\n", strerror(errno));
         }
     }
-
     return NULL;
 }
 
 int camera_init(struct anki_camera_handle** camera, int is_xray)
 {
-    if (g_last_camera_close_time.tv_sec != 0) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (now.tv_sec  - g_last_camera_close_time.tv_sec)  * 1000L
-                        + (now.tv_nsec - g_last_camera_close_time.tv_nsec) / 1000000L;
-        if (elapsed_ms < CAMERA_VFE_REOPEN_DELAY_MS) {
-            fprintf(stderr, "camera_init: waiting for VFE cooldown (%ld/%d ms elapsed)\n",
-                    elapsed_ms, CAMERA_VFE_REOPEN_DELAY_MS);
-            return -1;
-        }
-    }
+    char video_dev[128];
+    char subdev_dev[128];
+
+    if (camera == NULL) return -1;
+    wait_vfe_reopen_cooldown();
 
     memset(&g_ctx, 0, sizeof(g_ctx));
-    g_ctx.video_fd      = -1;
-    g_ctx.subdev_fd     = -1;
-    g_ctx.stop_pipe[0]  = -1;
-    g_ctx.stop_pipe[1]  = -1;
-    g_ctx.frame_id      = 1;
-    g_ctx.is_xray       = is_xray;
+    g_ctx.video_fd = -1;
+    g_ctx.subdev_fd = -1;
+    g_ctx.stop_pipe[0] = -1;
+    g_ctx.stop_pipe[1] = -1;
+    g_ctx.frame_id = 1;
+    g_ctx.is_xray = is_xray;
 
     pthread_mutex_init(&g_ctx.frame_mutex, NULL);
     pthread_cond_init(&g_ctx.frame_cond, NULL);
 
-    g_ctx.video_fd = open(VIDEO_DEVICE, O_RDWR);
+    resolve_video_device(video_dev, sizeof(video_dev));
+    resolve_sensor_subdev(subdev_dev, sizeof(subdev_dev));
+
+    g_ctx.video_fd = open(video_dev, O_RDWR | O_NONBLOCK);
     if (g_ctx.video_fd < 0) {
-        fprintf(stderr, "camera: Failed to open %s: %s\n", VIDEO_DEVICE, strerror(errno));
+        fprintf(stderr, "camera: Failed to open %s: %s\n", video_dev, strerror(errno));
+        camera_init_fail_cleanup();
         return -1;
     }
 
-    g_ctx.subdev_fd = open(SUBDEV_DEVICE, O_RDWR);
-
-    if (v4l2_set_format(&g_ctx) < 0) {
-        close(g_ctx.video_fd);
-        if (g_ctx.subdev_fd >= 0) close(g_ctx.subdev_fd);
-        return -1;
-    }
-
-    if (v4l2_request_buffers(&g_ctx) < 0) {
-        close(g_ctx.video_fd);
-        if (g_ctx.subdev_fd >= 0) close(g_ctx.subdev_fd);
+    g_ctx.subdev_fd = open(subdev_dev, O_RDWR | O_NONBLOCK);
+    if (v4l2_set_format(&g_ctx) < 0 || v4l2_request_buffers(&g_ctx) < 0) {
+        camera_init_fail_cleanup();
         return -1;
     }
 
     g_ctx.status = ANKI_CAMERA_STATUS_IDLE;
-
     *camera = (struct anki_camera_handle*)&g_ctx;
     return 0;
 }
@@ -520,10 +605,14 @@ void camera_pause(struct anki_camera_handle* camera, int pause)
         }
     } else {
         if (g_ctx.status == ANKI_CAMERA_STATUS_IDLE && g_ctx.num_buffers > 0) {
-            v4l2_queue_all_buffers(&g_ctx);
-            v4l2_start_streaming(&g_ctx);
+            if (v4l2_queue_all_buffers(&g_ctx) < 0) {
+                return;
+            }
+            if (v4l2_start_streaming(&g_ctx) < 0) {
+                return;
+            }
             if (start_capture_thread_only() != 0) {
-                v4l2_stop_streaming(&g_ctx);
+                (void)v4l2_stop_streaming(&g_ctx);
                 return;
             }
             g_ctx.status = ANKI_CAMERA_STATUS_RUNNING;

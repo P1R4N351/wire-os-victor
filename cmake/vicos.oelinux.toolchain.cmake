@@ -223,7 +223,18 @@ list(APPEND VICOS_LINKER_FLAGS
 list(APPEND VICOS_LINKER_FLAGS
     -Wl,-z,relro -Wl,-z,now)
 list(APPEND VICOS_COMPILER_FLAGS
-    -Wformat)
+    -Wformat
+    -D_FILE_OFFSET_BITS=64)
+
+# Legacy closed-source prebuilts (libnscube.so, libbabile.so, 3rd/libAVSCommon.so
+# exporting C++ to_time_t) use 32-bit time_t ABI; keep TIME64 opt-in at toolchain
+# scope while camera_client enables _TIME_BITS=64 directly and libvicos_time32_shim
+# protects runtime processes via LD_PRELOAD.
+option(VICOS_ENABLE_TIME64 "Enable 64-bit time_t (_TIME_BITS=64) for all C/C++ targets" OFF)
+if(VICOS_ENABLE_TIME64)
+    list(APPEND VICOS_COMPILER_FLAGS
+        -D_TIME_BITS=64)
+endif()
 
 # Convert these lists into strings.
 string(REPLACE ";" " " VICOS_COMPILER_FLAGS         "${VICOS_COMPILER_FLAGS}")
