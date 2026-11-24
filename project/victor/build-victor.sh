@@ -4,7 +4,7 @@ set -e
 
 CMAKE_VERSION="3.30.4"
 VICOS_SDK_VERSION="6.0.0-r08"
-GO_VERSION="1.24.4"
+GO_VERSION="1.26.11"
 PROTOC_VERSION="31.1"
 PROTOC_GEN_GO_VERSION="v1.36.6"
 PROTOC_GEN_GO_GRPC_VERSION="v1.5.1"
@@ -365,8 +365,12 @@ if [[ $BUILD_PROTOC_PLUGIN -eq 1 ]]; then
 fi
 
 if [ -z "${GO_EXE+x}" ]; then
-    ${TOPLEVEL}/project/build-scripts/download-go.sh ${GO_VERSION}
-    GO_EXE="${HOME}/.anki/go/dist/${GO_VERSION}/go/bin/go"
+    if [ -f "/usr/local/go/.vicos-arm-time64-patched" ] && [ -x "/usr/local/go/bin/go" ]; then
+        GO_EXE="/usr/local/go/bin/go"
+    else
+        ${TOPLEVEL}/project/build-scripts/download-go.sh ${GO_VERSION}
+        GO_EXE="${HOME}/.anki/go/dist/${GO_VERSION}/go/bin/go"
+    fi
 fi
 
 if [ -z "${UPX_EXE+x}" ]; then
